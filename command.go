@@ -195,6 +195,8 @@ type Command struct {
 	helpCommand *Command
 	// versionTemplate is the version template defined by user.
 	versionTemplate string
+
+	subCmds []*Command
 }
 
 // SetArgs sets arguments for the command. It is set to os.Args[1:] by default, if desired, can be overridden
