@@ -530,6 +530,59 @@ func (f *StringFlag) AddTo(c *Command) {
 	f.postAdd(c)
 }
 
+// StringSliceFlag -----------------------------------------------------------------
+
+type StringSliceFlag struct {
+	SerpentFlag
+}
+
+func NewStringSliceFlag(n string, opts ...*FlagOptList) *StringSliceFlag {
+	f := &StringSliceFlag{}
+	var d []string
+	f.Default = d
+	f.SerpentFlag.populate(n, d, opts...)
+	return f
+}
+
+func (f *StringSliceFlag) OptAbbr(a string) *StringSliceFlag {
+	f.Abbr = a
+	return f
+}
+
+func (f *StringSliceFlag) OptDesc(a string) *StringSliceFlag {
+	f.Desc = a
+	return f
+}
+
+func (f *StringSliceFlag) OptReq(a bool) *StringSliceFlag {
+	f.Req = a
+	return f
+}
+
+func (f *StringSliceFlag) OptUbiq(a bool) *StringSliceFlag {
+	f.Ubiq = a
+	return f
+}
+
+func (f *StringSliceFlag) OptDefault(a interface{}) *StringSliceFlag {
+	f.Default = a.([]string)
+	return f
+}
+
+func (f *StringSliceFlag) AddTo(c *Command) {
+	switch {
+	case f.Ubiq && len(f.Abbr) == 0:
+		c.PersistentFlags().StringSlice(f.Name, f.Default.([]string), f.Desc)
+	case f.Ubiq && len(f.Abbr) == 1:
+		c.PersistentFlags().StringSliceP(f.Name, f.Abbr, f.Default.([]string), f.Desc)
+	case !f.Ubiq && len(f.Abbr) == 0:
+		c.Flags().StringSlice(f.Name, f.Default.([]string), f.Desc)
+	case !f.Ubiq && len(f.Abbr) == 1:
+		c.Flags().StringSliceP(f.Name, f.Abbr, f.Default.([]string), f.Desc)
+	}
+	f.postAdd(c)
+}
+
 // UintFlag -----------------------------------------------------------------
 
 type UintFlag struct {

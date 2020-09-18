@@ -14,12 +14,15 @@ import (
 	"time"
 
 	homedir "github.com/mitchellh/go-homedir"
+	"github.com/rifflock/lfshook"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	"github.com/kevinkenan/rattler"
 )
 
-var serpent struct {
-	root *Command
+var Serpent struct {
+	Root    *Command
+	LogFile os.File
 }
 
 type SerpentError struct {
@@ -41,22 +44,60 @@ func NewApp(n string) (a *App) {
 }
 
 type Config struct {
-	RunWithoutConfigFile bool    // if false, execution stops if a config file is not found
-	ConfigFile           string  // the name of the config file without the extension
-	SearchLocalConfig    bool    // if true, viper looks in the working directory for a config file
-	UserConfigPath       string  // a path relative the user's home directory that viper searches
-	GlobalConfigPath     string  // an arbitrary path to look for config files
-	WatchConfig          bool    // if true, viper watches for changes in the config file
-	UseEnvVariables      bool    // if true, viper looks for configs in environment variables
-	EnvVarPrefix         string  // viper only looks at environment variables with the prefix
+	RequireConfigFile       bool   // if true, execution stops if a config file is not found
+	ReportMissingConfigFile bool   // logs an alert if the config file is optional and can't be found
+	RequireLogFile          bool   // if true, execution stops if the log file cannot be created
+	ReportMissingLogFile    bool   // logs an alert if the logfile is optional and cannot be created
+	ConfigFile              string // the name of the config file without the extension
+	SearchLocalConfig       bool   // if true, viper looks in the working directory for a config file
+	UserConfigPath          string // a path relative the user's home directory that viper searches
+	GlobalConfigPath        string // an arbitrary path to look for config files
+	WatchConfig             bool   // if true, viper watches for changes in the config file
+	UseEnvVariables         bool   // if true, viper looks for configs in environment variables
+	EnvVarPrefix            string // viper only looks at environment variables with the prefix
 }
 
-func NewConfig() (c *Config) {
-	c = &Config{}
+func NewTestingConfig(logtags []string) *Config {
+	c := &Config{}
+	c.SetDefault("verbose", true)
+	c.SetDefault("logtags", logtags)
+	m := map[string]interface{}{}
+	viper.Set("serpenttags", m)
+
+	stdout := new(SerpentFormatter)
+	stdout.Debug = true
+	log.SetFormatter(stdout)
+	log.SetLevel(log.DebugLevel)
+
+	// Set up log tags.
+	tags := GetStringSlice("logtags")
+	if len(tags) > 0 {
+		dt := viper.GetStringMap("serpenttags")
+		for _, t := range tags {
+			dt[t] = true
+		}
+	}
+
+	return c
+}
+
+func NewConfig(n string) *Config {
+	c := &Config{}
 	c.ConfigFile = "config"
-	c.RunWithoutConfigFile = true
 	c.SearchLocalConfig = true
-	return
+
+	// Configure logging
+	c.RequireLogFile = true
+	c.ReportMissingLogFile = true
+	m := map[string]interface{}{}
+	viper.Set("serpenttags", m)
+
+	// Configure stdout logging
+	stdout := new(SerpentFormatter)
+	log.SetFormatter(stdout)
+	log.SetLevel(log.DebugLevel)
+
+	return c
 }
 
 func (c *Config) SetDefault(k string, v interface{}) {
@@ -67,43 +108,130 @@ func (c *Config) Set(k string, v interface{}) {
 	viper.Set(k, v)
 }
 
-func NewCommand(n string) *Command {
-	return &Command{Use: n}
+func Set(k string, v interface{}) {
+	viper.Set(k, v)
+}
+
+func (c *Config) LogPanicOnly() {
+	log.SetLevel(log.PanicLevel)
+}
+
+func (c *Config) LogNormal() {
+	log.SetLevel(log.DebugLevel)
+}
+
+func NewCommand(n string) (c *Command) {
+	c = &Command{
+		Use: n,
+		PreRun: func(cmd *Command, args []string) {
+			// These two VisitAll calls are to bind the flags as late as
+			// possible in order to support flags on different commands with
+			// the same name but with different configurations, such as
+			// different defult values.
+			cmd.pflags.VisitAll(
+				func(f *pflag.Flag) { viper.BindPFlag(f.Name, cmd.PersistentFlags().Lookup(f.Name)) },
+			)
+			cmd.flags.VisitAll(
+				func(f *pflag.Flag) { viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name)) },
+			)
+		},
+	}
+	return
 }
 
 // Init initializes Serpent and returns the root Command.
 func Init(app *App, cfg *Config) (cmd *Command) {
 	cmd = &app.Command
 	cmd.AddFlags(NewStringFlag("config", Opts().Ubiq(true)))
+	cmd.AddFlags(NewBoolFlag("verbose", Opts().Ubiq(true).Abbr("v")))
+	cmd.AddFlags(NewStringFlag("log", Opts().Desc("path to the log file").Ubiq(true)))
+	cmd.AddFlags(NewStringSliceFlag("logtags", Opts().Ubiq(true)))
+	cmd.AddFlags(NewBoolFlag("logalltags", Opts().Ubiq(true)))
 	OnInitialize(func() { loadConfigs(app.Use, cfg) })
-	serpent.root = cmd
+	Serpent.Root = cmd
 	return
 }
 
 // Cobra executes this function after the command line has been parsed, but
 // before actual execution of the command.
 func loadConfigs(n string, cfg *Config) {
-	cfg.UserConfigPath = fmt.Sprintf(".%s", n)
+	// Do we want to read environment variables, maybe with a prefix?
 	if cfg.UseEnvVariables {
 		if len(cfg.EnvVarPrefix) > 0 {
 			viper.SetEnvPrefix(cfg.EnvVarPrefix)
 		}
 		viper.AutomaticEnv()
 	}
+
+	// Set config file name.
 	if c, ok := CheckString("config"); ok {
 		viper.SetConfigName(c)
 	} else {
 		viper.SetConfigName(cfg.ConfigFile)
 	}
+
+	// Set paths to check for config file.
+	cfg.UserConfigPath = fmt.Sprintf(".%s", n)
 	viper.AddConfigPath(".")
 	viper.AddConfigPath(getHomedir(cfg.UserConfigPath))
 	viper.AddConfigPath(fmt.Sprintf("%s/", cfg.GlobalConfigPath))
+
+	// Load the config file.
+	if err := viper.ReadInConfig(); err != nil {
+		switch {
+		case cfg.RequireConfigFile:
+			Out("exiting: can't read config file: ", err)
+			os.Exit(1)
+		case cfg.ReportMissingConfigFile:
+			Out("continuing without a config file")
+		}
+	}
+
+	// Watch the config file for changes if requested.
 	if cfg.WatchConfig {
 		viper.WatchConfig()
 	}
-	if err := viper.ReadInConfig(); err != nil && !cfg.RunWithoutConfigFile {
-		fmt.Println("Can't read config:", err)
+
+	// Set up log tags.
+	tags := GetStringSlice("logtags")
+	if len(tags) > 0 {
+		dt := viper.GetStringMap("serpenttags")
+		for _, t := range tags {
+			dt[t] = true
+		}
+	}
+
+	cfg.SetDefault("log", n+".log")
+	LoadLogFile(cfg)
+
+	// // Configure file logging via a logrus hook.
+	// f, err := os.Create(GetString("log"))
+	// switch {
+	// case err != nil && cfg.RequireLogFile:
+	// 	Out("exiting: can't access log file: ", err)
+	// 	os.Exit(1)
+	// case err != nil && cfg.ReportMissingLogFile:
+	// 	Out("continuing without a log file")
+	// default:
+	// 	tf := new(SerpentFormatter)
+	// 	tf.Debug = true
+	// 	log.AddHook(lfshook.NewHook(f, tf))
+	// }
+}
+
+func LoadLogFile(cfg *Config) {
+	// Configure file logging via a logrus hook.
+	f, err := os.Create(GetString("log"))
+	switch {
+	case err != nil && cfg.RequireLogFile:
+		Out("exiting: can't access log file: ", err)
 		os.Exit(1)
+	case err != nil && cfg.ReportMissingLogFile:
+		Out("continuing without a log file")
+	default:
+		tf := new(SerpentFormatter)
+		tf.Debug = true
+		log.AddHook(lfshook.NewHook(f, tf))
 	}
 }
 
@@ -146,11 +274,15 @@ func buildCommands(c *Command) *Command {
 
 // parses the command line and executes the command
 func Execute() {
-	root := buildCommands(serpent.root)
+	root := buildCommands(Serpent.Root)
 	if err := root.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+}
+
+func ShutDown() {
+	Serpent.LogFile.Close()
 }
 
 // Serpent flag system --------------------------------------------------------
@@ -204,21 +336,23 @@ func (f *SerpentFlag) postAdd(c *Command) {
 	switch {
 	case f.Req && f.Ubiq:
 		c.MarkPersistentFlagRequired(f.Name)
-		viper.BindPFlag(f.Name, c.PersistentFlags().Lookup(f.Name))
+		// viper.BindPFlag(f.Name, c.PersistentFlags().Lookup(f.Name))
 	case f.Req && !f.Ubiq:
 		c.MarkFlagRequired(f.Name)
-		viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name))
+		// viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name))
 	case !f.Req && f.Ubiq:
-		viper.BindPFlag(f.Name, c.PersistentFlags().Lookup(f.Name))
+		// viper.BindPFlag(f.Name, c.PersistentFlags().Lookup(f.Name))
 	default:
-		viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name))
+		// viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name))
 	}
+
 	switch {
 	case len(f.Implied) > 0 && f.Ubiq:
 		c.PersistentFlags().Lookup(f.Name).NoOptDefVal = f.Implied
 	case len(f.Implied) > 0 && !f.Ubiq:
 		c.Flags().Lookup(f.Name).NoOptDefVal = f.Implied
 	}
+
 	switch {
 	case f.Hide && f.Ubiq:
 		c.PersistentFlags().MarkHidden(f.Name)
@@ -226,6 +360,21 @@ func (f *SerpentFlag) postAdd(c *Command) {
 		c.Flags().MarkHidden(f.Name)
 	}
 }
+
+// func bindFlag(c *Command, f *pflag.Flag) {
+// 	switch {
+// 	case f.Req && f.Ubiq:
+// 		// c.MarkPersistentFlagRequired(f.Name)
+// 		viper.BindPFlag(f.Name, c.PersistentFlags().Lookup(f.Name))
+// 	case f.Req && !f.Ubiq:
+// 		// c.MarkFlagRequired(f.Name)
+// 		viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name))
+// 	case !f.Req && f.Ubiq:
+// 		viper.BindPFlag(f.Name, c.PersistentFlags().Lookup(f.Name))
+// 	default:
+// 		viper.BindPFlag(f.Name, c.Flags().Lookup(f.Name))
+// 	}
+// }
 
 type FlagOpt struct {
 	FlagOptType
